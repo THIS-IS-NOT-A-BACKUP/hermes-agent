@@ -39,6 +39,7 @@ from typing import Dict, Optional, Any, List, Union
 # gateway is a long-running daemon, so its boot cost matters less than
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent.i18n import t
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -91,46 +92,6 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # is still classified fresh.  Override via
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
-
-
-# --- Stale-code self-check ------------------------------------------------
-# Long-running gateway processes that survive an ``hermes update`` keep the
-# old ``hermes_cli.config`` (and friends) cached in ``sys.modules``.  When
-# the updated tool files on disk then try to ``from hermes_cli.config
-# import cfg_get`` (added in PR #17304), the import resolves against the
-# already-loaded stale module object and raises ``ImportError`` — see
-# Issue #17648.  Rather than papering over the import failure site-by-site
-# in every tool file, detect the stale state centrally and auto-restart
-# so the gateway reloads with fresh code.  The sentinel files below are
-# the canonical repo-level markers that every update touches; if any is
-# newer than the gateway's boot time, we know the running process is out
-# of date.
-_STALE_CODE_SENTINELS: tuple[str, ...] = (
-    "hermes_cli/config.py",
-    "hermes_cli/__init__.py",
-    "run_agent.py",
-    "gateway/run.py",
-    "pyproject.toml",
-)
-
-
-def _compute_repo_mtime(repo_root: Path) -> float:
-    """Return the newest mtime across the stale-code sentinel files.
-
-    Missing files are ignored (they may not exist on older checkouts).
-    Returns 0.0 if no sentinel file is readable — treat that as "can't
-    tell", which downstream callers interpret as "not stale" to avoid
-    false-positive restart loops.
-    """
-    newest = 0.0
-    for rel in _STALE_CODE_SENTINELS:
-        try:
-            st = (repo_root / rel).stat()
-        except (OSError, FileNotFoundError):
-            continue
-        if st.st_mtime > newest:
-            newest = st.st_mtime
-    return newest
 
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
@@ -1000,12 +961,6 @@ class GatewayRunner:
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
-    # Stale-code self-check defaults (see _detect_stale_code()).  Class-level
-    # so tests that construct GatewayRunner via ``object.__new__`` without
-    # running __init__ don't crash when _handle_message reads these.
-    _boot_wall_time: float = 0.0
-    _boot_repo_mtime: float = 0.0
-    _stale_code_restart_triggered: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -1013,22 +968,6 @@ class GatewayRunner:
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
-
-        # Boot-time snapshot used by the stale-code self-check.  Captured
-        # before any work happens so post-update file writes are guaranteed
-        # to have newer mtimes.  See _detect_stale_code() / Issue #17648.
-        try:
-            self._boot_wall_time: float = time.time()
-            self._repo_root_for_staleness: Path = Path(__file__).resolve().parent.parent
-            self._boot_repo_mtime: float = _compute_repo_mtime(
-                self._repo_root_for_staleness,
-            )
-        except Exception:
-            self._boot_wall_time = 0.0
-            self._repo_root_for_staleness = Path(".")
-            self._boot_repo_mtime = 0.0
-        self._stale_code_notified: set[str] = set()
-        self._stale_code_restart_triggered: bool = False
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
@@ -2737,63 +2676,6 @@ class GatewayRunner:
         task.add_done_callback(self._background_tasks.discard)
         return True
 
-    def _detect_stale_code(self) -> bool:
-        """Return True if source files on disk are newer than the running process.
-
-        A gateway that survives ``hermes update`` (manual SIGTERM never
-        escalated, systemd restart race, detached-process respawn failed,
-        etc.) keeps pre-update modules cached in ``sys.modules``.  Later
-        imports of names added post-update — e.g. ``cfg_get`` from PR
-        #17304 — raise ImportError against the stale module object (see
-        Issue #17648).  Detecting this at the source — "the code on disk
-        is newer than me" — lets us auto-restart instead of serving
-        broken responses until the user notices and runs
-        ``hermes gateway restart`` manually.
-
-        Returns False when the boot-time snapshot is unavailable or no
-        sentinel file is readable, to avoid false-positive restart loops
-        in unusual checkouts (sparse clones, read-only filesystems).
-        """
-        if not self._boot_wall_time or not self._boot_repo_mtime:
-            return False
-        try:
-            current = _compute_repo_mtime(self._repo_root_for_staleness)
-        except Exception:
-            return False
-        if current <= 0.0:
-            return False
-        # 2-second slack guards against filesystems with coarse mtime
-        # resolution (FAT32, some NFS mounts).  Real updates always move
-        # the newest-file mtime forward by minutes, so this doesn't hide
-        # genuine staleness.
-        return current > self._boot_repo_mtime + 2.0
-
-    def _trigger_stale_code_restart(self) -> None:
-        """Idempotently kick off a graceful restart after stale-code detection.
-
-        Runs at most once per process.  The restart request goes through
-        the normal drain path so in-flight agent turns finish before the
-        process exits; the service manager (systemd / launchd / detached
-        profile watcher) then respawns with fresh code.  On manual
-        ``hermes gateway run`` installs without a supervisor, the
-        process exits and the user must restart by hand — but they get a
-        user-visible message telling them so.
-        """
-        if self._stale_code_restart_triggered:
-            return
-        self._stale_code_restart_triggered = True
-        logger.warning(
-            "Stale-code self-check: source files newer than gateway boot "
-            "time (boot=%.0f, newest=%.0f) — requesting graceful restart. "
-            "See Issue #17648.",
-            self._boot_repo_mtime,
-            _compute_repo_mtime(self._repo_root_for_staleness),
-        )
-        try:
-            self.request_restart(detached=False, via_service=True)
-        except Exception as exc:
-            logger.error("Stale-code restart request failed: %s", exc)
-
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -3752,7 +3634,17 @@ class GatewayRunner:
             return out
 
         def _ready_nonempty() -> bool:
-            """Cheap probe: is there a ready+assigned+unclaimed task on ANY board?"""
+            """Cheap probe: is there at least one ready+assigned+unclaimed
+            task on ANY board whose assignee maps to a real Hermes profile
+            (i.e. one the dispatcher would actually spawn for)?
+
+            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
+            ``orion-research``) are pulled by terminals via
+            ``claim_task`` directly and never spawnable, so a queue full
+            of those is "correctly idle", not "stuck". Filtering them out
+            here keeps the stuck-warn fire only on real failures (broken
+            PATH, missing venv, credential loss for a real Hermes profile).
+            """
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -3762,12 +3654,7 @@ class GatewayRunner:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    row = conn.execute(
-                        "SELECT 1 FROM tasks "
-                        "WHERE status = 'ready' AND assignee IS NOT NULL "
-                        "    AND claim_lock IS NULL LIMIT 1"
-                    ).fetchone()
-                    if row is not None:
+                    if _kb.has_spawnable_ready(conn):
                         return True
                 except Exception:
                     continue
@@ -4719,27 +4606,6 @@ class GatewayRunner:
         """
         source = event.source
 
-        # Stale-code self-check (Issue #17648).  A gateway that survives
-        # ``hermes update`` keeps old modules cached in sys.modules; the
-        # first inbound message is our earliest safe chance to detect
-        # this and restart gracefully before we dispatch to the agent
-        # and hit ImportError on freshly-added names (e.g. cfg_get).
-        # Idempotent — runs the real check at most once per message, and
-        # request_restart() no-ops after the first call.
-        try:
-            if self._detect_stale_code():
-                self._trigger_stale_code_restart()
-                # Acknowledge to the user so they don't see a silent
-                # drop; the gateway will be back up in a moment via the
-                # service manager / profile-watcher respawn.
-                return (
-                    "⟳ Gateway code was updated in the background — "
-                    "restarting this gateway so your next message runs "
-                    "on the new code. Please retry in a moment."
-                )
-        except Exception as _stale_exc:
-            logger.debug("Stale-code self-check failed: %s", _stale_exc)
-
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -4866,10 +4732,12 @@ class GatewayRunner:
                     response_text = raw
             if response_text:
                 response_path = _hermes_home / ".update_response"
+                prompt_path = _hermes_home / ".update_prompt.json"
                 try:
                     tmp = response_path.with_suffix(".tmp")
                     tmp.write_text(response_text)
                     tmp.replace(response_path)
+                    prompt_path.unlink(missing_ok=True)
                 except OSError as e:
                     logger.warning("Failed to write update response: %s", e)
                     return f"✗ Failed to send response to update process: {e}"
@@ -4884,10 +4752,12 @@ class GatewayRunner:
             # The slash command then falls through to normal dispatch.
             if _recognized_cmd:
                 response_path = _hermes_home / ".update_response"
+                prompt_path = _hermes_home / ".update_prompt.json"
                 try:
                     tmp = response_path.with_suffix(".tmp")
                     tmp.write_text("")
                     tmp.replace(response_path)
+                    prompt_path.unlink(missing_ok=True)
                     logger.info(
                         "Recognized /%s during pending update prompt for %s; "
                         "cancelled prompt with default and dispatching command",
@@ -7508,7 +7378,7 @@ class GatewayRunner:
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             if count:
-                return f"⏳ Draining {count} active agent(s) before restart..."
+                return t("gateway.draining", count=count)
             return EphemeralReply("⏳ Gateway restart already in progress...")
 
         # Save the requester's routing info so the new gateway process can
@@ -7560,7 +7430,7 @@ class GatewayRunner:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return f"⏳ Draining {active_agents} active agent(s) before restart..."
+            return t("gateway.draining", count=active_agents)
         return EphemeralReply("♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`.")
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
@@ -7708,6 +7578,7 @@ class GatewayRunner:
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
             list_authenticated_providers,
+            list_picker_providers,
         )
         from hermes_cli.providers import get_label
 
@@ -7762,7 +7633,7 @@ class GatewayRunner:
 
             if has_picker:
                 try:
-                    providers = list_authenticated_providers(
+                    providers = list_picker_providers(
                         current_provider=current_provider,
                         current_base_url=current_base_url,
                         current_model=current_model,
@@ -8230,7 +8101,7 @@ class GatewayRunner:
         if lower in ("clear", "stop", "done"):
             had = mgr.has_goal()
             mgr.clear()
-            return "✓ Goal cleared." if had else "No active goal."
+            return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
 
         # Otherwise — treat the remaining text as the new goal.
         try:
@@ -9448,7 +9319,7 @@ class GatewayRunner:
         try:
             user_config: dict = _load_gateway_config()
         except Exception as e:
-            return f"⚠️ Could not read config.yaml: {e}"
+            return t("gateway.config_read_failed", error=e)
 
         effective = resolve_footer_config(user_config, platform_key)
 
@@ -9481,7 +9352,7 @@ class GatewayRunner:
             atomic_yaml_write(config_path, user_config)
         except Exception as e:
             logger.warning("Failed to save runtime_footer.enabled: %s", e)
-            return f"⚠️ Could not save config: {e}"
+            return t("gateway.config_save_failed", error=e)
 
         state = "ON" if new_state else "OFF"
         example = ""
@@ -10919,7 +10790,7 @@ class GatewayRunner:
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
-                return "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
+                return t("gateway.approval_expired")
             return "No pending command to approve."
 
         # Parse args: support "all", "all session", "all always", "session", "always"
@@ -11334,12 +11205,13 @@ class GatewayRunner:
                                 f"or type your answer directly.",
                                 metadata=metadata,
                             )
+                        # Keep the prompt marker on disk until the user
+                        # answers. If the gateway restarts mid-prompt, the
+                        # next watcher can recover by re-forwarding it from
+                        # disk. Duplicate sends in the same process are
+                        # still suppressed by _update_prompt_pending.
                         self._update_prompt_pending[session_key] = True
-                        # Remove the prompt file so it isn't re-read on the
-                        # next poll cycle.  The update process only needs
                         # .update_response to continue — it doesn't re-check
-                        # .update_prompt.json while waiting.
-                        prompt_path.unlink(missing_ok=True)
                         logger.info("Forwarded update prompt to %s: %s", session_key, prompt_text[:80])
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
@@ -14849,15 +14721,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     runner = GatewayRunner(config)
     
-    # Track whether a signal initiated the shutdown (vs. internal request).
-    # When an unexpected SIGTERM kills the gateway, we exit non-zero so
-    # systemd's Restart=on-failure revives the process.  systemctl stop
-    # is safe: systemd tracks stop-requested state independently of exit
-    # code, so Restart= never fires for a deliberate stop.
+    # Track whether an unexpected signal initiated the shutdown. When an
+    # unexpected SIGTERM kills the gateway, we exit non-zero so service
+    # managers can revive the process. Planned stop paths write a marker
+    # before signalling us so they can exit cleanly instead.
     _signal_initiated_shutdown = False
 
     # Set up signal handlers
-    def shutdown_signal_handler():
+    def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
@@ -14873,9 +14744,27 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         except Exception as e:
             logger.debug("Takeover marker check failed: %s", e)
 
+        # Planned stop check: service managers and `hermes gateway stop`
+        # also send SIGTERM, which is indistinguishable from an unexpected
+        # external kill unless the CLI marks it first. SIGINT comes from an
+        # interactive Ctrl+C and is likewise an intentional foreground stop.
+        planned_stop = False
+        if received_signal == signal.SIGINT:
+            planned_stop = True
+        elif not planned_takeover:
+            try:
+                from gateway.status import consume_planned_stop_marker_for_self
+                planned_stop = consume_planned_stop_marker_for_self()
+            except Exception as e:
+                logger.debug("Planned stop marker check failed: %s", e)
+
         if planned_takeover:
             logger.info(
                 "Received SIGTERM as a planned --replace takeover — exiting cleanly"
+            )
+        elif planned_stop:
+            logger.info(
+                "Received SIGTERM/SIGINT as a planned gateway stop — exiting cleanly"
             )
         else:
             _signal_initiated_shutdown = True
@@ -14912,7 +14801,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, shutdown_signal_handler)
+                loop.add_signal_handler(sig, shutdown_signal_handler, sig)
             except NotImplementedError:
                 pass
         if hasattr(signal, "SIGUSR1"):
@@ -15010,14 +14899,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
 
-    # When a signal (SIGTERM/SIGINT) caused the shutdown and it wasn't a
-    # planned restart (/restart, /update, SIGUSR1), exit non-zero so
-    # systemd's Restart=on-failure revives the process.  This covers:
+    # When an unexpected SIGTERM caused the shutdown and it wasn't a planned
+    # restart (/restart, /update, SIGUSR1), exit non-zero so systemd's
+    # Restart=on-failure revives the process.  This covers:
     #   - hermes update killing the gateway mid-work
     #   - External kill commands
     #   - WSL2/container runtime sending unexpected signals
-    # systemctl stop is safe: systemd tracks "stop requested" state
-    # independently of exit code, so Restart= never fires for it.
+    # `hermes gateway stop` and interactive Ctrl+C are handled above as
+    # planned stops and should not trigger service-manager revival.
     if _signal_initiated_shutdown and not runner._restart_requested:
         logger.info(
             "Exiting with code 1 (signal-initiated shutdown without restart "
