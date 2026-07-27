@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 import hermes_state
+from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
 
@@ -3008,6 +3009,31 @@ class TestPruneSessions:
         assert session is not None
         assert session["id"] == "new"
 
+    def test_age_preview_and_prune_use_last_activity(self, db):
+        old_ts = time.time() - 100 * 86400
+        for sid in ("inactive", "recently-active"):
+            db.create_session(session_id=sid, source="telegram")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (old_ts, sid),
+            )
+        db.end_session("inactive", end_reason="agent_close")
+        db.append_message(
+            "recently-active",
+            role="user",
+            content="A recent message in a long-lived conversation.",
+        )
+        db.end_session("recently-active", end_reason="agent_close")
+        db._conn.commit()
+
+        candidates = db.list_prune_candidates(older_than_days=90)
+
+        assert [row["id"] for row in candidates] == ["inactive"]
+        assert candidates[0]["last_active"] == pytest.approx(old_ts)
+        assert db.prune_sessions(older_than_days=90) == 1
+        assert db.get_session("inactive") is None
+        assert db.get_session("recently-active") is not None
+
     def test_prune_skips_active_sessions(self, db):
         db.create_session(session_id="active", source="cli")
         # Backdate but don't end
@@ -4649,6 +4675,110 @@ class TestListSessionsRich:
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
 
+    def test_last_active_prefers_session_activity_heartbeat(self, db):
+        """Mid-turn agent heartbeats must advance last_active without new messages (#72016)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "hello")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp=? WHERE session_id=? AND role=?",
+                (1_700_000_000.0, "s1", "user"),
+            )
+            db._conn.commit()
+
+        before = db.list_sessions_rich()[0]["last_active"]
+        heartbeat = 1_700_000_500.0
+        db.touch_session_activity(
+            "s1",
+            heartbeat,
+            description="starting API call #1",
+            provenance=ActivityProvenance.UNKNOWN,
+        )
+        after = db.list_sessions_rich()[0]["last_active"]
+        assert after == heartbeat
+        assert after > before
+
+        row = db.get_session("s1")
+        assert row["last_activity_at"] == heartbeat
+        assert row["last_activity_description"] == "starting API call #1"
+        assert row["last_activity_provenance"] == "unknown"
+
+        activity = db.get_session_activity("s1")
+        assert activity["last_activity_at"] == heartbeat
+        assert activity["last_activity_description"] == "starting API call #1"
+        assert "phase" not in activity
+
+        # Never move last_activity_at backwards.
+        db.touch_session_activity("s1", heartbeat - 100, description="ignored")
+        assert db.get_session("s1")["last_activity_at"] == heartbeat
+        assert db.get_session("s1")["last_activity_description"] == "starting API call #1"
+
+    def test_clear_session_activity_labels_keeps_timestamp(self, db):
+        """Turn-end label clear must wipe desc/provenance without moving ts."""
+        db.create_session("s1", "cli")
+        heartbeat = 1_700_000_500.0
+        db.touch_session_activity(
+            "s1",
+            heartbeat,
+            description="compressing context",
+            provenance=ActivityProvenance.AGENT_COMPRESSION,
+        )
+        row = db.get_session("s1")
+        assert row["last_activity_at"] == heartbeat
+        assert row["last_activity_description"] == "compressing context"
+        assert row["last_activity_provenance"] == "agent.compression"
+
+        db.clear_session_activity_labels("s1")
+        row = db.get_session("s1")
+        assert row["last_activity_at"] == heartbeat
+        assert row["last_activity_description"] == ""
+        assert row["last_activity_provenance"] == "unknown"
+        activity = db.get_session_activity("s1")
+        assert activity["last_activity_at"] == heartbeat
+        assert activity["last_activity_description"] == ""
+        assert activity["last_activity_provenance"] == "unknown"
+
+    def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
+        """Rate-limited heartbeats can lag message writes; last_active must take max."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "hello")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp=? WHERE session_id=?",
+                (1_700_000_800.0, "s1"),
+            )
+            db._conn.commit()
+        db.touch_session_activity("s1", 1_700_000_500.0, description="api")  # older than message
+        assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_800.0
+
+    def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
+        db.create_session(
+            "gw-1",
+            "telegram",
+            session_key="agent:main:telegram:dm:c1",
+            chat_id="c1",
+            chat_type="dm",
+        )
+        db.append_message("gw-1", "user", "ping")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp=? WHERE session_id=?",
+                (1_700_000_000.0, "gw-1"),
+            )
+            db._conn.commit()
+
+        heartbeat = 1_700_000_900.0
+        db.touch_session_activity(
+            "gw-1",
+            heartbeat,
+            description="compressing context",
+        )
+        rows = db.list_gateway_sessions(active_only=True)
+        assert len(rows) == 1
+        assert rows[0]["last_active"] == heartbeat
+        activity = db.get_session_activity("gw-1")
+        assert activity["last_activity_description"] == "compressing context"
+
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
         db.create_session("old", "cli")
@@ -5547,6 +5677,39 @@ class TestAutoMaintenance:
         assert not (sessions_dir / "request_dump_old1_001.json").exists()
         # Active session's transcript is untouched
         assert (sessions_dir / "new.jsonl").exists()
+
+    def test_auto_prune_preserves_old_session_with_recent_activity(self, db, tmp_path):
+        """Retention is based on activity, not when a conversation began."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+
+        db.create_session(session_id="long-lived", source="telegram")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 100 * 86400, "long-lived"),
+        )
+        db._conn.commit()
+        db.append_message(
+            "long-lived",
+            role="user",
+            content="This conversation was active today.",
+        )
+        db.end_session("long-lived", end_reason="agent_close")
+        transcript = sessions_dir / "long-lived.jsonl"
+        transcript.write_text('{"role":"user","content":"recent"}\n')
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90,
+            vacuum=False,
+            sessions_dir=sessions_dir,
+        )
+
+        assert result["pruned"] == 0
+        assert db.get_session("long-lived") is not None
+        assert [m["content"] for m in db.get_messages("long-lived")] == [
+            "This conversation was active today."
+        ]
+        assert transcript.exists()
 
     def test_auto_prune_without_sessions_dir_preserves_files(self, db, tmp_path):
         """Backward-compat: no sessions_dir = DB-only cleanup (legacy behavior)."""

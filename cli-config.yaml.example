@@ -778,10 +778,10 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
-  # Maximum tool-calling iterations per conversation
+  # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
-  max_turns: 60
+  max_turns: 500
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
@@ -792,6 +792,12 @@ agent:
   # Fires once per run when inactivity reaches this threshold (seconds).
   # Set to 0 to disable the warning.
   # gateway_timeout_warning: 900
+
+  # Session stall watchdog (seconds). When a busy session has a pending
+  # inbound follow-up and the agent activity clock is idle this long, the
+  # gateway logs a WARNING and notifies the user to try /new. Does not kill
+  # the turn (see gateway_timeout). 0 = disable. Default 300.
+  # session_stall_timeout: 300
 
   # Graceful drain timeout for gateway stop/restart (seconds).
   # Default 0 = no drain: a restart interrupts in-flight agents immediately,

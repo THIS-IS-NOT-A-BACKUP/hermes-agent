@@ -127,7 +127,7 @@ def test_compression_activity_heartbeat_touches_agent_during_long_compress(tmp_p
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
 
     def _slow_compress(*_a, **_kw):
         _wait_for_touch(touch_calls, "context compression in progress")
@@ -156,7 +156,7 @@ def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Pa
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
 
     def _failing_compress(*_a, **_kw):
         _wait_for_touch(touch_calls, "context compression in progress")
@@ -182,7 +182,7 @@ def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> 
 
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
-    agent._touch_activity = lambda _desc: (_ for _ in ()).throw(RuntimeError("touch boom"))
+    agent._touch_activity = lambda _desc, **_kw: (_ for _ in ()).throw(RuntimeError("touch boom"))
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
@@ -207,7 +207,7 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = "not-a-number"
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     strict_calls: list[int | None] = []
@@ -240,7 +240,13 @@ def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: 
 
     agent = _build_agent_with_db(db, session_id)
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    touch_provenances: list = []
+
+    def _capture(desc, *, provenance=None):
+        touch_calls.append(desc)
+        touch_provenances.append(provenance)
+
+    agent._touch_activity = _capture
 
     heartbeat = _CompressionActivityHeartbeat(agent, interval_seconds=float("inf"))
 
@@ -248,7 +254,104 @@ def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: 
     heartbeat.start()
     heartbeat.stop()
     assert touch_calls == ["context compression started", "context compression completed"]
+    from agent.session_activity import ActivityProvenance
 
+    assert touch_provenances == [
+        ActivityProvenance.AGENT_COMPRESSION,
+        ActivityProvenance.AGENT_COMPRESSION,
+    ]
+
+
+def test_compression_heartbeat_does_not_clobber_timeout_provenance() -> None:
+    """Detached heartbeat/stop must not overwrite a host timeout stamp."""
+    from types import SimpleNamespace
+
+    from agent.conversation_compression import _CompressionActivityHeartbeat
+    from agent.session_activity import ActivityProvenance
+
+    agent = SimpleNamespace(
+        _last_activity_provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+        _last_activity_desc="context compression timed out",
+        touches=[],
+    )
+
+    def _touch(desc, *, provenance=None):
+        agent.touches.append((desc, provenance))
+        agent._last_activity_provenance = provenance
+        agent._last_activity_desc = desc
+
+    agent._touch_activity = _touch
+
+    hb = _CompressionActivityHeartbeat(agent, interval_seconds=60.0)
+    hb._touch("context compression in progress")
+    hb.stop("context compression completed")
+
+    assert agent.touches == []
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION_TIMEOUT
+    assert agent._last_activity_desc == "context compression timed out"
+
+
+def test_compression_heartbeat_does_not_clobber_cooldown_provenance() -> None:
+    """Cooldown/abort stamps must also survive a late heartbeat stop."""
+    from types import SimpleNamespace
+
+    from agent.conversation_compression import _CompressionActivityHeartbeat
+    from agent.session_activity import ActivityProvenance
+
+    agent = SimpleNamespace(
+        _last_activity_provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+        _last_activity_desc="compression blocked (cooldown: 30s remaining)",
+        touches=[],
+    )
+
+    def _touch(desc, *, provenance=None):
+        agent.touches.append((desc, provenance))
+        agent._last_activity_provenance = provenance
+        agent._last_activity_desc = desc
+
+    agent._touch_activity = _touch
+
+    hb = _CompressionActivityHeartbeat(agent, interval_seconds=60.0)
+    hb._touch("context compression in progress")
+    hb.stop("context compression failed")
+
+    assert agent.touches == []
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION_COOLDOWN
+
+
+def test_compression_heartbeat_start_republishes_after_terminal_provenance() -> None:
+    """A new compression episode may overwrite a prior timeout/cooldown stamp."""
+    from types import SimpleNamespace
+
+    from agent.conversation_compression import _CompressionActivityHeartbeat
+    from agent.session_activity import ActivityProvenance
+
+    agent = SimpleNamespace(
+        _last_activity_provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+        _last_activity_desc="context compression timed out",
+        touches=[],
+    )
+
+    def _touch(desc, *, provenance=None):
+        agent.touches.append((desc, provenance))
+        agent._last_activity_provenance = provenance
+        agent._last_activity_desc = desc
+
+    agent._touch_activity = _touch
+
+    hb = _CompressionActivityHeartbeat(agent, interval_seconds=60.0)
+    hb.start()
+    hb.stop()
+
+    assert agent.touches[0] == (
+        "context compression started",
+        ActivityProvenance.AGENT_COMPRESSION,
+    )
+    assert agent.touches[-1] == (
+        "context compression completed",
+        ActivityProvenance.AGENT_COMPRESSION,
+    )
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION
 
 
 def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
@@ -340,10 +443,17 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
-def test_durable_message_committed_before_lease_aborts_stale_snapshot(
+def test_durable_message_committed_before_lease_is_adopted(
     tmp_path: Path,
 ) -> None:
-    """A durable row absent from the caller snapshot must survive in the parent."""
+    """A durable row absent from the caller snapshot must still be compressed.
+
+    Previously this path aborted and returned the stale snapshot unchanged,
+    which permanently wedged busy sessions: every compress attempt saw the
+    DB ahead of the in-memory list, logged "changed before lease
+    acquisition", and never called the compressor. Adopting the durable
+    transcript keeps the late-committed turn and lets compression proceed.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "PRE_LEASE_DURABLE_RACE"
     db.create_session(parent_sid, source="webui")
@@ -359,15 +469,20 @@ def test_durable_message_committed_before_lease_aborts_stale_snapshot(
         stale_snapshot, "sys", approx_tokens=120_000
     )
 
-    assert returned is stale_snapshot
-    assert agent.session_id == parent_sid
-    assert db.find_live_compression_child(parent_sid) is None
-    assert [m["content"] for m in db.get_messages_as_conversation(parent_sid)] == [
+    agent.context_compressor.compress.assert_called_once()
+    compressed_arg = agent.context_compressor.compress.call_args.args[0]
+    assert [m["content"] for m in compressed_arg] == [
         "old durable",
         "late committed before lease",
     ]
-    agent.context_compressor.compress.assert_not_called()
-
+    # Must not echo the stale snapshot — compression proceeded on the
+    # adopted durable transcript (rotation publishes a child session).
+    assert returned is not stale_snapshot
+    assert returned[0]["content"] == "[CONTEXT COMPACTION] summary"
+    assert agent.session_id != parent_sid
+    child_id = _live_child_id(db, parent_sid)
+    assert child_id is not None
+    assert child_id == agent.session_id
 
 def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     """The loser of the lock race must return its input messages verbatim.
