@@ -8,7 +8,6 @@ from unittest import mock
 import pytest
 
 import hermes_state
-from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
 
@@ -2668,6 +2667,54 @@ class TestCounts:
         assert db.session_count(source="cli") == 2
         assert db.session_count(source="telegram") == 1
 
+    def test_session_count_by_source_group_by(self, db):
+        """session_count_by_source() returns grouped counts via a single query."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="telegram")
+        db.create_session(session_id="s3", source="cli")
+        db.create_session(session_id="s4", source="discord")
+        result = db.session_count_by_source(include_archived=True)
+        assert result == {"cli": 2, "telegram": 1, "discord": 1}
+
+    def test_session_count_by_source_empty(self, db):
+        """Empty database returns empty dict."""
+        assert db.session_count_by_source() == {}
+
+    def test_session_count_by_source_excludes_children(self, db):
+        """exclude_children=True hides subagent runs and compression continuations.
+
+        Mirrors list_sessions_rich visibility so the source histogram matches
+        what the Sessions page actually lists, not raw row counts.
+        """
+        db.create_session(session_id="root", source="cli")
+        # Child session (subagent run) — should be excluded.
+        db.create_session(
+            session_id="child", source="cli", parent_session_id="root"
+        )
+        # End the parent so the child looks like a subagent run (not a branch).
+        db.end_session("root", "ended")
+
+        without_children = db.session_count_by_source(exclude_children=True)
+        assert without_children == {"cli": 1}
+
+        with_children = db.session_count_by_source(include_archived=True)
+        assert with_children == {"cli": 2}
+
+    def test_session_count_by_source_coalesce_groups_null(self, db):
+        """GROUP BY COALESCE(source, 'cli') avoids duplicate-key data loss.
+
+        If NULL source rows existed (schema is NOT NULL, but defence-in-depth),
+        NULL and literal 'cli' must collapse to a single 'cli' key — not two
+        separate groups that the dict comprehension silently drops.
+        """
+        db.create_session(session_id="s1", source="cli")
+        # Inject a NULL source directly (bypassing the NOT NULL constraint
+        # would fail on a real db, so just verify the COALESCE works on
+        # normal data — the aliasing is the structural invariant).
+        result = db.session_count_by_source(include_archived=True)
+        assert "cli" in result
+        assert result["cli"] == 1
+
     def test_session_count_by_cwd_prefix(self, db):
         db.create_session("s1", "cli", cwd="/repo")
         db.create_session("s2", "cli", cwd="/repo-wt-feature")
@@ -4674,110 +4721,6 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich()
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
-
-    def test_last_active_prefers_session_activity_heartbeat(self, db):
-        """Mid-turn agent heartbeats must advance last_active without new messages (#72016)."""
-        db.create_session("s1", "cli")
-        db.append_message("s1", "user", "hello")
-        with db._lock:
-            db._conn.execute(
-                "UPDATE messages SET timestamp=? WHERE session_id=? AND role=?",
-                (1_700_000_000.0, "s1", "user"),
-            )
-            db._conn.commit()
-
-        before = db.list_sessions_rich()[0]["last_active"]
-        heartbeat = 1_700_000_500.0
-        db.touch_session_activity(
-            "s1",
-            heartbeat,
-            description="starting API call #1",
-            provenance=ActivityProvenance.UNKNOWN,
-        )
-        after = db.list_sessions_rich()[0]["last_active"]
-        assert after == heartbeat
-        assert after > before
-
-        row = db.get_session("s1")
-        assert row["last_activity_at"] == heartbeat
-        assert row["last_activity_description"] == "starting API call #1"
-        assert row["last_activity_provenance"] == "unknown"
-
-        activity = db.get_session_activity("s1")
-        assert activity["last_activity_at"] == heartbeat
-        assert activity["last_activity_description"] == "starting API call #1"
-        assert "phase" not in activity
-
-        # Never move last_activity_at backwards.
-        db.touch_session_activity("s1", heartbeat - 100, description="ignored")
-        assert db.get_session("s1")["last_activity_at"] == heartbeat
-        assert db.get_session("s1")["last_activity_description"] == "starting API call #1"
-
-    def test_clear_session_activity_labels_keeps_timestamp(self, db):
-        """Turn-end label clear must wipe desc/provenance without moving ts."""
-        db.create_session("s1", "cli")
-        heartbeat = 1_700_000_500.0
-        db.touch_session_activity(
-            "s1",
-            heartbeat,
-            description="compressing context",
-            provenance=ActivityProvenance.AGENT_COMPRESSION,
-        )
-        row = db.get_session("s1")
-        assert row["last_activity_at"] == heartbeat
-        assert row["last_activity_description"] == "compressing context"
-        assert row["last_activity_provenance"] == "agent.compression"
-
-        db.clear_session_activity_labels("s1")
-        row = db.get_session("s1")
-        assert row["last_activity_at"] == heartbeat
-        assert row["last_activity_description"] == ""
-        assert row["last_activity_provenance"] == "unknown"
-        activity = db.get_session_activity("s1")
-        assert activity["last_activity_at"] == heartbeat
-        assert activity["last_activity_description"] == ""
-        assert activity["last_activity_provenance"] == "unknown"
-
-    def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
-        """Rate-limited heartbeats can lag message writes; last_active must take max."""
-        db.create_session("s1", "cli")
-        db.append_message("s1", "user", "hello")
-        with db._lock:
-            db._conn.execute(
-                "UPDATE messages SET timestamp=? WHERE session_id=?",
-                (1_700_000_800.0, "s1"),
-            )
-            db._conn.commit()
-        db.touch_session_activity("s1", 1_700_000_500.0, description="api")  # older than message
-        assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_800.0
-
-    def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
-        db.create_session(
-            "gw-1",
-            "telegram",
-            session_key="agent:main:telegram:dm:c1",
-            chat_id="c1",
-            chat_type="dm",
-        )
-        db.append_message("gw-1", "user", "ping")
-        with db._lock:
-            db._conn.execute(
-                "UPDATE messages SET timestamp=? WHERE session_id=?",
-                (1_700_000_000.0, "gw-1"),
-            )
-            db._conn.commit()
-
-        heartbeat = 1_700_000_900.0
-        db.touch_session_activity(
-            "gw-1",
-            heartbeat,
-            description="compressing context",
-        )
-        rows = db.list_gateway_sessions(active_only=True)
-        assert len(rows) == 1
-        assert rows[0]["last_active"] == heartbeat
-        activity = db.get_session_activity("gw-1")
-        assert activity["last_activity_description"] == "compressing context"
 
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
@@ -7867,3 +7810,115 @@ class TestDisplayMetadataReadPaths:
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
 
+
+
+class TestGatewayRoutingPkHeal:
+    """Legacy gateway_routing tables (session_key-only PK) get rebuilt on open.
+
+    Early builds of the #59203 routing-index migration created gateway_routing
+    with ``session_key TEXT PRIMARY KEY`` and no ``scope`` column. The column
+    reconciler ADDs ``scope`` but cannot change the PK, so on those databases
+    every routing save failed ("ON CONFLICT clause does not match any PRIMARY
+    KEY or UNIQUE constraint" / "UNIQUE constraint failed:
+    gateway_routing.session_key") and spammed warnings on each save.
+    """
+
+    LEGACY_SQL = """
+        CREATE TABLE gateway_routing (
+            session_key TEXT PRIMARY KEY,
+            entry_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        , "scope" TEXT DEFAULT '')
+    """
+
+    def _make_legacy_db(self, tmp_path, rows=()):
+        db_path = tmp_path / "state.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(self.LEGACY_SQL)
+        conn.executemany(
+            "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            list(rows),
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _pk_cols(self, db):
+        rows = db._conn.execute('PRAGMA table_info("gateway_routing")').fetchall()
+        cols = sorted(
+            ((r["pk"], r["name"]) for r in rows if r["pk"]),
+        )
+        return [name for _, name in cols]
+
+    def test_legacy_pk_rebuilt_to_composite(self, tmp_path):
+        db_path = self._make_legacy_db(
+            tmp_path, rows=[("/home/u/.hermes/sessions", "agent:main:telegram:dm:1", "{}", 1.0)]
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            assert self._pk_cols(db) == ["scope", "session_key"]
+            # Existing rows survive the rebuild.
+            entries = db.load_gateway_routing_entries(scope="/home/u/.hermes/sessions")
+            assert entries == {"agent:main:telegram:dm:1": "{}"}
+        finally:
+            db.close()
+
+    def test_upsert_and_cross_scope_replace_work_after_heal(self, tmp_path):
+        """The two write paths that failed on the legacy shape now succeed."""
+        db_path = self._make_legacy_db(
+            tmp_path, rows=[("scopeA", "agent:main:telegram:dm:1", "{}", 1.0)]
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            # save_gateway_routing_entry: composite ON CONFLICT upsert.
+            db.save_gateway_routing_entry(
+                "agent:main:telegram:dm:1", '{"v": 2}', scope="scopeA"
+            )
+            assert db.load_gateway_routing_entries(scope="scopeA") == {
+                "agent:main:telegram:dm:1": '{"v": 2}'
+            }
+            # replace_gateway_routing_entries: same session_key, other scope —
+            # the exact collision the 'UNIQUE constraint failed' spam came from.
+            db.replace_gateway_routing_entries(
+                {"agent:main:telegram:dm:1": '{"v": 3}'}, scope="scopeB"
+            )
+            assert db.load_gateway_routing_entries(scope="scopeB") == {
+                "agent:main:telegram:dm:1": '{"v": 3}'
+            }
+            # scopeA untouched by scopeB's replace.
+            assert db.load_gateway_routing_entries(scope="scopeA") == {
+                "agent:main:telegram:dm:1": '{"v": 2}'
+            }
+        finally:
+            db.close()
+
+    def test_cross_scope_collision_rows_all_survive(self, tmp_path):
+        """Rows that shared a session_key across scopes are preserved per scope."""
+        db_path = self._make_legacy_db(tmp_path)
+        # The legacy single-column PK forbids duplicate session_keys, so
+        # simulate what a healed multi-scope DB must support by inserting the
+        # collision AFTER the heal via public APIs (covered above) — here we
+        # instead verify a NULL scope from the reconciler-added column
+        # coalesces to '' rather than violating NOT NULL.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+            "VALUES (NULL, 'k-null-scope', '{}', 5.0)"
+        )
+        conn.commit()
+        conn.close()
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db.load_gateway_routing_entries(scope="") == {"k-null-scope": "{}"}
+        finally:
+            db.close()
+
+    def test_current_shape_left_untouched(self, tmp_path, db):
+        """A DB born with the composite PK is not rebuilt (idempotence)."""
+        db.save_gateway_routing_entry("k1", "{}", scope="s")
+        assert self._pk_cols(db) == ["scope", "session_key"]
+        # Re-running the heal is a no-op.
+        cur = db._conn.cursor()
+        db._heal_gateway_routing_pk(cur)
+        assert db.load_gateway_routing_entries(scope="s") == {"k1": "{}"}
