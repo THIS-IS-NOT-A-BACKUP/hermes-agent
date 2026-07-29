@@ -600,7 +600,7 @@ class AIAgent:
 
             self._session_db = SessionDB()
             return self._session_db
-        except Exception as exc:
+        except Exception:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
             return None
 
@@ -781,41 +781,66 @@ class AIAgent:
             except Exception as exc:
                 logger.debug("context engine bind_session_state during reset: %s", exc)
 
-    def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
-        """
-        Preload the LM Studio model unless configured to rely on LM Studio JIT loading.
-        """
+    @staticmethod
+    def _effective_lmstudio_context_length(
+        config_context_length: Optional[int],
+        runtime_context_length: Any,
+    ) -> Optional[int]:
+        """Return a safe context budget from explicit intent and verified runtime."""
+        explicit = (
+            config_context_length
+            if isinstance(config_context_length, int)
+            and not isinstance(config_context_length, bool)
+            and config_context_length > 0
+            else None
+        )
+        runtime_value = getattr(runtime_context_length, "context_length", runtime_context_length)
+        runtime = (
+            runtime_value
+            if isinstance(runtime_value, int)
+            and not isinstance(runtime_value, bool)
+            and runtime_value > 0
+            else None
+        )
+        if bool(getattr(runtime_context_length, "rejected", False)) or (
+            bool(getattr(runtime_context_length, "load_attempted", False))
+            and runtime is None
+        ):
+            return None
+        if runtime is not None and explicit is not None:
+            return min(runtime, explicit)
+        return runtime if runtime is not None else explicit
+
+    @staticmethod
+    def _lmstudio_load_was_unverified(load_result: Any) -> bool:
+        """Return true when a management load was rejected or unverifiable."""
+        return bool(getattr(load_result, "rejected", False)) or (
+            bool(getattr(load_result, "load_attempted", False))
+            and getattr(load_result, "context_length", None) is None
+        )
+
+    def _ensure_lmstudio_runtime_loaded(
+        self,
+        config_context_length: Optional[int] = None,
+    ) -> Any:
+        """Preload LM Studio unless configured to rely on JIT loading."""
         if (self.provider or "").strip().lower() != "lmstudio":
-            return
+            return None
         if (getattr(self, "lmstudio_load_mode", "explicit") or "explicit").strip().lower() == "jit":
             logger.debug("LM Studio explicit preload skipped: lmstudio_load_mode=jit")
-            return
-        try:
-            from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
-            from hermes_cli.models import ensure_lmstudio_model_loaded
-            if config_context_length is None:
-                config_context_length = getattr(self, "_config_context_length", None)
-            target_ctx = max(config_context_length or 0, MINIMUM_CONTEXT_LENGTH)
-            loaded_ctx = ensure_lmstudio_model_loaded(
-                self.model, self.base_url, getattr(self, "api_key", ""), target_ctx,
-            )
-            if loaded_ctx:
-                # Push into the live compressor so the status bar reflects the
-                # real loaded ctx the moment the load resolves, instead of
-                # holding the previous model's value (or "ctx --") through the
-                # next render tick.
-                cc = getattr(self, "context_compressor", None)
-                if cc is not None:
-                    cc.update_model(
-                        model=self.model,
-                        context_length=loaded_ctx,
-                        base_url=self.base_url,
-                        api_key=getattr(self, "api_key", ""),
-                        provider=self.provider,
-                        api_mode=self.api_mode,
-                    )
-        except Exception as err:
-            logger.debug("LM Studio preload skipped: %s", err)
+            return None
+
+        from hermes_cli.models import ensure_lmstudio_model_loaded
+
+        if config_context_length is None:
+            config_context_length = getattr(self, "_config_context_length", None)
+        return ensure_lmstudio_model_loaded(
+            self.model,
+            self.base_url,
+            getattr(self, "api_key", ""),
+            config_context_length,
+            return_load_result=True,
+        )
 
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
@@ -1979,7 +2004,27 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
-            for _msg_idx, msg in enumerate(messages):
+            # Bounded scan: skip the longest identity-matched prefix of the
+            # list snapshot taken at the end of the previous successful flush.
+            # Every message in that snapshot was already given its final
+            # disposition (written+stamped, stamped as durable history, or
+            # skipped as ephemeral scaffolding / non-dict), and no code path
+            # pops _DB_PERSISTED_MARKER from a live dict in place (compression
+            # strips markers on fresh copies, which breaks identity here and
+            # forces a full re-scan). Identity match ⇒ identical skip decision,
+            # so starting after the matched prefix is behavior-preserving.
+            _scan_start = 0
+            _prev_prefix = getattr(self, "_db_flush_scan_prefix", None)
+            if isinstance(_prev_prefix, list):
+                _limit = min(len(_prev_prefix), len(messages))
+                while (
+                    _scan_start < _limit
+                    and messages[_scan_start] is _prev_prefix[_scan_start]
+                ):
+                    _scan_start += 1
+
+            for _msg_idx in range(_scan_start, len(messages)):
+                msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
                     continue
                 # Never write ephemeral recovery scaffolding to the session
@@ -2128,8 +2173,14 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            # Snapshot for the bounded scan above — only on full success, so
+            # a partially-processed list can never be treated as settled.
+            self._db_flush_scan_prefix = messages[:]
             return True
         except Exception as e:
+            # Force a full re-scan on the next flush: an exception mid-loop
+            # leaves messages with mixed dispositions.
+            self._db_flush_scan_prefix = None
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -3544,6 +3595,9 @@ class AIAgent:
                 self._credits_session_start_micros = _fixture.remaining_micros
             _latch = getattr(self, "_credits_latch", None)
             if isinstance(_latch, dict):
+                # Only seen_below_90 — never seen_grant_unspent (priming it would
+                # fire grant_spent on a fixture's first observation, the exact
+                # every-session nag the gate exists to prevent).
                 _latch["seen_below_90"] = True  # let warn90 fire without a real crossing
             _used = _fixture.used_fraction
             logger.info(
@@ -3622,10 +3676,10 @@ class AIAgent:
         if state is None:
             return
         try:
-            from agent.credits_tracker import evaluate_credits_notices, is_free_tier_model
+            from agent.credits_tracker import evaluate_credits_notices, is_free_tier_model, new_credits_latch
             latch = getattr(self, "_credits_latch", None)
             if latch is None:
-                latch = self._credits_latch = {"active": set(), "seen_below_90": False, "usage_band": None}
+                latch = self._credits_latch = new_credits_latch()
             # Free-model gate: a depleted account on a free model can still
             # inference, so the depleted error banner is suppressed. Local-data
             # only (":free" suffix + pricing-cache peek) — never a network call.
@@ -6710,10 +6764,13 @@ class AIAgent:
         *,
         logger=None,
         session_id: str = None,
+        cursor=None,
     ) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.sanitize_tool_call_arguments``."""
         from agent.agent_runtime_helpers import sanitize_tool_call_arguments
-        return sanitize_tool_call_arguments(messages, logger=logger, session_id=session_id)
+        return sanitize_tool_call_arguments(
+            messages, logger=logger, session_id=session_id, cursor=cursor
+        )
 
     def _should_sanitize_tool_calls(self) -> bool:
         """Determine if tool_calls need sanitization for strict APIs.

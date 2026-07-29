@@ -249,11 +249,41 @@ def sanitize_tool_call_arguments(
     *,
     logger=None,
     session_id: str = None,
+    cursor: Optional[dict] = None,
 ) -> int:
-    """Repair corrupted assistant tool-call argument JSON in-place."""
+    """Repair corrupted assistant tool-call argument JSON in-place.
+
+    ``cursor`` (optional) is a caller-owned dict used to skip re-validating
+    messages already validated on a previous call.  It stores, under
+    ``"prefix"``, the exact message *objects* (strong references) validated
+    last time, in order.  On the next call, the longest contiguous prefix of
+    ``messages`` whose objects are ``is``-identical to the stored prefix is
+    skipped; scanning starts at the first divergence (conservative: any
+    reordering, truncation, compression rewrite, or mid-list insertion breaks
+    identity at that index and everything from there is re-scanned).
+
+    Safety argument for skipping: a message in the matched prefix was fully
+    scanned before — every tool_call argument was either already valid JSON
+    or was rewritten to ``"{}"`` (valid).  The only code paths that mutate
+    ``function["arguments"]`` on live history dicts between calls are the
+    surrogate / non-ASCII sanitizers, which substitute characters *inside*
+    JSON string values and cannot invalidate JSON syntax.  Compression,
+    repair, undo, and steer paths replace or reorder message dicts, which
+    breaks the identity match and forces a re-scan.  Holding strong
+    references (the objects themselves, not ``id()``s) makes address reuse
+    aliasing (#50372-style) impossible.
+    """
     log = logger or logging.getLogger(__name__)
     if not isinstance(messages, list):
         return 0
+
+    start_index = 0
+    if cursor is not None:
+        prev_prefix = cursor.get("prefix")
+        if isinstance(prev_prefix, list):
+            limit = min(len(prev_prefix), len(messages))
+            while start_index < limit and messages[start_index] is prev_prefix[start_index]:
+                start_index += 1
 
     repaired = 0
     marker = _ra().AIAgent._TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER
@@ -275,7 +305,7 @@ def sanitize_tool_call_arguments(
             existing_text = str(existing)
         tool_msg["content"] = f"{marker}\n{existing_text}"
 
-    message_index = 0
+    message_index = start_index
     while message_index < len(messages):
         msg = messages[message_index]
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -355,6 +385,12 @@ def sanitize_tool_call_arguments(
                 repaired += 1
 
         message_index += 1
+
+    if cursor is not None:
+        # Strong references to the exact objects validated this call, in
+        # order. Any future divergence (compression, undo, repair, steer)
+        # breaks identity at the divergent index and re-scans from there.
+        cursor["prefix"] = messages[:]
 
     return repaired
 
@@ -2137,6 +2173,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         agent, "_credential_pool_entry_id", _MISSING
     )
 
+    def _restore_snapshot() -> None:
+        for _name, _value in _snapshot.items():
+            if _value is _MISSING:
+                # Attribute did not exist before the swap — don't fabricate it.
+                continue
+            try:
+                setattr(agent, _name, _value)
+            except Exception:  # noqa: BLE001
+                pass
+
     try:
         # Clear the per-config context_length override so the new model's
         # actual context window is resolved via get_model_context_length()
@@ -2305,15 +2351,41 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # caller's exception handler can surface a meaningful warning.  The
         # exception is re-raised; cli.py / gateway/run.py / tui_gateway catch
         # it and print "Agent swap failed; change applied to next session".
-        for _name, _value in _snapshot.items():
-            if _value is _MISSING:
-                # Attribute did not exist before the swap — don't fabricate it.
-                continue
-            try:
-                setattr(agent, _name, _value)
-            except Exception:  # noqa: BLE001
-                pass
+        _restore_snapshot()
         raise
+
+    # ── LM Studio: preload before probing context length ──
+    _sm_custom_providers = None
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            get_custom_provider_context_length,
+            load_config,
+        )
+
+        _sm_cfg = load_config()
+        _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+        _destination_context_intent = get_custom_provider_context_length(
+            model=agent.model,
+            base_url=agent.base_url,
+            custom_providers=_sm_custom_providers,
+        )
+    except Exception:
+        _destination_context_intent = None
+    agent._config_context_length = _destination_context_intent
+    _runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+        _destination_context_intent
+    )
+    if agent._lmstudio_load_was_unverified(_runtime_context_length):
+        logger.warning(
+            "LM Studio model activation was rejected or completed without a "
+            "verifiable active context length during model switch; continuing "
+            "with configured context"
+        )
+    _effective_context_length = agent._effective_lmstudio_context_length(
+        _destination_context_intent,
+        _runtime_context_length,
+    )
 
     # ── Re-evaluate prompt caching ──
     agent._use_prompt_caching, agent._use_native_cache_layout = (
@@ -2325,22 +2397,15 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         )
     )
 
-    # ── LM Studio: preload before probing context length ──
-    agent._ensure_lmstudio_runtime_loaded()
-
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         from agent.model_metadata import get_model_context_length
-        # Re-read custom_providers from live config so per-model
-        # context_length overrides are honored when switching to a
-        # custom provider mid-session (closes #15779).
-        _sm_custom_providers = None
-        try:
-            from hermes_cli.config import load_config, get_compatible_custom_providers
-            _sm_cfg = load_config()
-            _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
-        except Exception:
-            _sm_custom_providers = None
+        if _sm_custom_providers is None:
+            try:
+                from hermes_cli.config import get_compatible_custom_providers, load_config
+                _sm_custom_providers = get_compatible_custom_providers(load_config())
+            except Exception:
+                _sm_custom_providers = None
         # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
         # token provider). ``get_model_context_length`` expects a
         # string for its live-probe paths; for Foundry the context
@@ -2352,7 +2417,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             base_url=agent.base_url,
             api_key=_ctx_api_key,
             provider=agent.provider,
-            config_context_length=getattr(agent, "_config_context_length", None),
+            config_context_length=_effective_context_length,
             custom_providers=_sm_custom_providers,
         )
         agent.context_compressor.update_model(
