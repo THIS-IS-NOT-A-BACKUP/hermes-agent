@@ -433,6 +433,7 @@ import functools as _functools
 from hermes_cli.sessions_cmd import cmd_sessions  # noqa: F401
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
+from hermes_cli.subcommands.sync import build_sync_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
@@ -793,6 +794,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
+    _model_flow_ai_gateway,
 )
 logger = logging.getLogger(__name__)
 
@@ -2021,30 +2023,44 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 tui_dir,
                 include_child_workspaces=True,
             )
-        result = subprocess.run(
-            [
-                npm,
-                "install",
-                *npm_workspace_args,
-                # --include=dev: ui-tui's build toolchain (esbuild, typescript)
-                # lives in devDependencies. An inherited NODE_ENV=production
-                # (e.g. from a container shell or a parent TUI launch) or an
-                # npm `omit=dev` config would silently skip them and the TUI
-                # build would fail. See _run_npm_install_deterministic.
-                "--include=dev",
-                "--silent",
-                "--no-fund",
-                "--no-audit",
-                "--progress=false",
-            ],
-            cwd=str(npm_cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env={**os.environ, "CI": "1"},
-        )
+        npm_install_cmd = [
+            npm,
+            "install",
+            *npm_workspace_args,
+            # --include=dev: ui-tui's build toolchain (esbuild, typescript)
+            # lives in devDependencies. An inherited NODE_ENV=production
+            # (e.g. from a container shell or a parent TUI launch) or an
+            # npm `omit=dev` config would silently skip them and the TUI
+            # build would fail. See _run_npm_install_deterministic.
+            "--include=dev",
+            "--silent",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+        ]
+
+        def _run_tui_install() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                npm_install_cmd,
+                cwd=str(npm_cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "CI": "1"},
+            )
+
+        result = _run_tui_install()
+        if result.returncode != 0:
+            # An npm outside the root package.json's `engines.npm` range fails
+            # here before doing any work; upgrade a Hermes-managed npm once and
+            # retry rather than dumping EBADENGINE at the user.
+            from hermes_cli.npm_engine import maybe_repair_npm_engine
+
+            combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            if maybe_repair_npm_engine(npm, combined_output):
+                result = _run_tui_install()
         if result.returncode != 0:
             combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
             preview = "\n".join(combined.splitlines()[-30:])
@@ -3027,7 +3043,11 @@ def select_provider_and_model(args=None):
         load_config,
         get_env_value,
     )
-    from hermes_cli.providers import resolve_provider_full
+    from hermes_cli.providers import (
+        custom_provider_aliases,
+        custom_provider_slug,
+        resolve_provider_full,
+    )
 
     config = load_config()
     current_model = config.get("model")
@@ -3147,13 +3167,8 @@ def select_provider_and_model(args=None):
             base_url = (entry.get("base_url") or "").strip()
             if not name or not base_url:
                 continue
-            key = "custom:" + name.lower().replace(" ", "-")
             provider_key = (entry.get("provider_key") or "").strip()
-            if provider_key:
-                try:
-                    resolve_provider(provider_key)
-                except AuthError:
-                    key = provider_key
+            key = custom_provider_slug(name, provider_key)
             custom_provider_map[key] = {
                 "name": name,
                 "base_url": base_url,
@@ -3181,6 +3196,16 @@ def select_provider_and_model(args=None):
         config
     )  # key → {name, base_url, api_key}
 
+    def _canonical_named_custom_key(provider_id: str) -> str:
+        requested = str(provider_id or "").strip().lower()
+        for key, provider_info in _custom_provider_map.items():
+            if requested in custom_provider_aliases(
+                provider_info.get("name", ""),
+                provider_info.get("provider_key", ""),
+            ):
+                return key
+        return provider_id
+
     def _active_custom_key_from_base_url() -> str:
         if effective_provider != "custom" or not isinstance(model_cfg, dict):
             return ""
@@ -3203,6 +3228,8 @@ def select_provider_and_model(args=None):
         )
         if active_def is not None:
             active = active_def.id
+            if active_def.source == "user-config":
+                active = _canonical_named_custom_key(active)
         else:
             warning = (
                 f"Unknown provider '{effective_provider}'. Check 'hermes model' for "
@@ -3369,6 +3396,8 @@ def select_provider_and_model(args=None):
         _model_flow_openrouter(config, current_model)
     elif selected_provider == "moa":
         _model_flow_moa(config, current_model)
+    elif selected_provider == "ai-gateway":
+        _model_flow_ai_gateway(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model, args=args)
     elif selected_provider == "openai-codex":
@@ -4536,6 +4565,201 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_sync(args):
+    """Skill Sync — personal sync across devices, plus sharing with your org."""
+    import json as _json
+
+    sub = getattr(args, "sync_command", None)
+
+    if sub in {None, ""}:
+        print(
+            "usage: hermes sync "
+            "<status|pull|push|now|enable|disable|device|propose>\n"
+            "\n"
+            "Your skills, across your devices:\n"
+            "  status            Show what is synced, and from where\n"
+            "  pull              Pull your synced skills\n"
+            "  push              Push your opted-in skills\n"
+            "  now               Reconcile now: pull then push\n"
+            "  enable <skill>    Include a skill in your sync\n"
+            "  disable <skill>   Exclude a skill from your sync\n"
+            "  device [--name N] Show or set this device's label\n"
+            "\n"
+            "Shared with your team:\n"
+            "  propose <skill>   Share a skill with your organisation",
+            file=sys.stderr,
+        )
+        return 1
+
+    if sub == "device":
+        from tools import skills_sync_client as ssc
+
+        name = getattr(args, "device_name", None)
+        if name is not None:
+            try:
+                stored = ssc.set_device_name(name)
+            except ValueError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+            print(f"device label set to '{stored}'.")
+            print(
+                "New commits from this device will use this label; existing "
+                "commits keep their previous one.",
+                file=sys.stderr,
+            )
+            return 0
+        # No --name: print the current (creating a default on first use).
+        print(ssc.stable_device_id())
+        return 0
+
+    if sub == "propose":
+        from tools import skills_sync_client as ssc
+
+        name = args.name
+        try:
+            result = ssc.propose_skill(name, message=args.message)
+        except ssc.SyncInertError as e:
+            print(f"cannot share this skill: {e}", file=sys.stderr)
+            return 1
+        except ssc.SyncError as e:
+            print(f"could not share '{name}': {e}", file=sys.stderr)
+            return 1
+        if result.get("proposal_pending"):
+            print(
+                f"Shared '{name}' with your organisation — an admin needs to "
+                f"approve it (proposal #{result.get('proposal_id')}). It is "
+                f"not live for the team until then."
+            )
+        else:
+            print(f"Added '{name}' to your organisation's shared skills.")
+        return 0
+
+    if sub in {"enable", "disable"}:
+        from tools.skill_usage import set_sync, is_curation_eligible
+
+        skill = args.skill
+        if not is_curation_eligible(skill):
+            print(
+                f"'{skill}' is not sync-eligible (bundled, hub-installed, "
+                f"external, or not found). Only agent-created / user-authored "
+                f"skills under ~/.hermes/skills/ can sync.",
+                file=sys.stderr,
+            )
+            return 1
+        set_sync(skill, sub == "enable")
+        print(f"sync {'enabled' if sub == 'enable' else 'disabled'} for '{skill}'.")
+        return 0
+
+    from tools import skills_sync_client as ssc
+
+    if sub == "status":
+        status = ssc.sync_status()
+        print(_json.dumps(status, indent=2, ensure_ascii=False))
+        if status.get("org_available"):
+            n = len(status.get("org_skills") or [])
+            modified = status.get("org_skills_modified") or []
+            print(
+                f"\nOrg skills: {n} shared skill(s) from your organisation "
+                f"(your role: {status.get('org_role')}). They load alongside "
+                f"your own, labeled by origin, and you can edit them.",
+                file=sys.stderr,
+            )
+            if modified:
+                print(
+                    f"  {len(modified)} with local edits not yet shared: "
+                    f"{', '.join(modified)}\n"
+                    f"  Share them back with `hermes sync propose <skill>`. "
+                    f"Org updates will not overwrite them.",
+                    file=sys.stderr,
+                )
+        elif status.get("logged_in"):
+            print(
+                "\nOrg skills: not applicable — this account isn't a member "
+                "of a shared organisation.",
+                file=sys.stderr,
+            )
+        if not status.get("logged_in"):
+            print("\nNot logged into Nous Portal — sync is inert.", file=sys.stderr)
+        elif not status.get("nous_admin"):
+            print(
+                "\nSync is not enabled for your account yet.",
+                file=sys.stderr,
+            )
+        elif not status.get("feature_enabled"):
+            print(
+                "\nSync feature is off for this instance (set HERMES_SYNC_ENABLED=1 "
+                "or config.yaml sync.enabled: true). Sync is inert.",
+                file=sys.stderr,
+            )
+        elif not status.get("base_url"):
+            print(
+                "\nNo sync base URL configured (config.yaml sync.base_url or "
+                "HERMES_SYNC_BASE_URL). Sync is inert.",
+                file=sys.stderr,
+            )
+        return 0
+
+    # pull / push / now — enforce the gate up front with a clear message.
+    try:
+        identity = ssc.resolve_identity()
+    except ssc.SyncInertError as e:
+        print(f"sync inert: {e}", file=sys.stderr)
+        return 1
+    if not identity.get("nous_admin"):
+        print(
+            "sync unavailable: not enabled for your account yet.",
+            file=sys.stderr,
+        )
+        return 1
+    if not ssc.resolve_sync_base_url():
+        print(
+            "sync inert: no sync base URL configured (config.yaml sync.base_url "
+            "or HERMES_SYNC_BASE_URL).",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        if sub == "pull":
+            result = ssc.pull_skills(identity=identity)
+            # Refresh the org mirror too when this account belongs to an
+            # organisation (no-op otherwise), so one pull covers both.
+            org_result = ssc.maybe_pull_org_skills()
+            if org_result:
+                n = len(org_result.get("updated") or [])
+                print(
+                    f"org: refreshed {n} shared skill(s) from your "
+                    f"organisation.",
+                    file=sys.stderr,
+                )
+                clashes = org_result.get("conflicted") or []
+                if clashes:
+                    print(
+                        f"org: {len(clashes)} skill(s) have BOTH local edits "
+                        f"and org updates, so they were left as-is: "
+                        f"{', '.join(clashes)}\n"
+                        f"     Your local version is intact. Review it, then "
+                        f"either propose it or delete the local copy and pull "
+                        f"again to take the org version.",
+                        file=sys.stderr,
+                    )
+        elif sub == "push":
+            result = ssc.push_skills(identity=identity, message="hermes sync push")
+        elif sub == "now":
+            pull_res = ssc.pull_skills(identity=identity)
+            push_res = ssc.push_skills(identity=identity, message="hermes sync now")
+            result = {"pull": pull_res, "push": push_res}
+        else:
+            print(f"Unknown sync subcommand: {sub}", file=sys.stderr)
+            return 1
+    except ssc.SyncError as e:
+        print(f"sync failed: {e}", file=sys.stderr)
+        return 1
+
+    print(_json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -4677,9 +4901,11 @@ def cmd_import(args):
 
 def _print_version_info(*, check_updates: bool = True) -> None:
     from hermes_cli.config import detect_install_method
-    from hermes_cli.banner import format_banner_version_label
+    from hermes_cli.slash_exec import CommandContext, execute_command
 
-    print(format_banner_version_label())
+    # Core version line is registry-owned (shared with the gateway /version);
+    # the install/python/SDK detail below is CLI-only decoration.
+    print(execute_command("version", CommandContext(surface="cli")).text)
     print(f"Install directory: {PROJECT_ROOT}")
     print(f"Install method: {detect_install_method(PROJECT_ROOT)}")
 
@@ -5242,34 +5468,84 @@ def _run_npm_install_deterministic(
     # install path and nix/lib.nix npm ci hooks.
     run_env = {**os.environ, **(env or {}), "CI": "1"}
 
-    lockfile = cwd / "package-lock.json"
-    if lockfile.exists():
-        ci_cmd = [npm, "ci", "--include=dev", *extra_args]
-        ci_result = subprocess.run(
-            ci_cmd,
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+        return _run_npm_watching_for_engine_failure(
+            cmd,
             cwd=cwd,
             env=run_env,
             capture_output=capture_output,
+        )
+
+    def _attempt() -> subprocess.CompletedProcess:
+        lockfile = cwd / "package-lock.json"
+        if lockfile.exists():
+            ci_result = _run([npm, "ci", "--include=dev", *extra_args])
+            if ci_result.returncode == 0:
+                return ci_result
+            # Fall through to `npm install` — lockfile may be out of sync on a
+            # WIP fork/branch, or `npm ci` may not be available on very old npm.
+        return _run([npm, "install", "--no-save", "--include=dev", *extra_args])
+
+    result = _attempt()
+    if result.returncode == 0:
+        return result
+
+    # An npm outside the root package.json's `engines.npm` range fails every
+    # command here identically (the `npm install` fallback included), so the
+    # failure is worth exactly one upgrade attempt. `maybe_repair_npm_engine`
+    # returns True only when it actually upgraded a Hermes-managed npm.
+    from hermes_cli.npm_engine import maybe_repair_npm_engine
+
+    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if not maybe_repair_npm_engine(npm, combined):
+        return result
+    return _attempt()
+
+
+def _run_npm_watching_for_engine_failure(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    capture_output: bool,
+) -> subprocess.CompletedProcess:
+    """Run *cmd*, always retaining stderr so ``EBADENGINE`` stays detectable.
+
+    ``capture_output=False`` callers stream npm's progress live and would
+    otherwise hand back a ``CompletedProcess`` with ``stderr=None``, leaving the
+    engine-failure recovery nothing to read. Tee stderr instead: each line is
+    forwarded to this process's stderr as it arrives (so live output is
+    unchanged) and accumulated for the caller.
+    """
+    if capture_output:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
         )
-        if ci_result.returncode == 0:
-            return ci_result
-        # Fall through to `npm install` — lockfile may be out of sync on a
-        # WIP fork/branch, or `npm ci` may not be available on very old npm.
-    install_cmd = [npm, "install", "--no-save", "--include=dev", *extra_args]
-    return subprocess.run(
-        install_cmd,
+
+    captured: list[str] = []
+    with subprocess.Popen(
+        cmd,
         cwd=cwd,
-        env=run_env,
-        capture_output=capture_output,
+        env=env,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
-    )
+    ) as proc:
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                captured.append(line)
+                sys.stderr.write(line)
+            sys.stderr.flush()
+        returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, None, "".join(captured))
 
 
 def _missing_web_build_tool(output: str) -> str | None:
@@ -7339,6 +7615,22 @@ def _lazy_refresh_marker_path() -> Path:
     return PROJECT_ROOT / ".lazy-refresh-incomplete"
 
 
+def _pytest_owns_live_checkout(root: Path) -> bool:
+    """True when running under pytest AND ``root`` is this checkout itself.
+
+    Tests that drive update/recovery without sandboxing ``PROJECT_ROOT``
+    must neither litter the live repo root with recovery breadcrumbs
+    (a leftover ``.lazy-refresh-incomplete`` / ``.update-incomplete``
+    false-arms recovery on the developer's next real launch) nor run a real
+    reinstall against the executing venv. Sandboxed tests point at a
+    tmp_path and are unaffected (same posture as
+    ``managed_scope._under_pytest``)."""
+    return (
+        "PYTEST_CURRENT_TEST" in os.environ
+        and root == Path(__file__).resolve().parent.parent
+    )
+
+
 def _clear_marker_file(path: Path, *, label: str) -> None:
     """Remove an update-recovery breadcrumb. Never raises."""
     try:
@@ -7385,6 +7677,8 @@ def _recover_from_interrupted_install() -> None:
     protocol stream (``hermes acp`` speaks JSON-RPC on stdout) must never get
     install noise on stdout.
     """
+    if _pytest_owns_live_checkout(PROJECT_ROOT):
+        return
     core_marker = _update_marker_path().exists()
     lazy_marker = _lazy_refresh_marker_path().exists()
     if not core_marker and not lazy_marker:
@@ -8785,9 +9079,28 @@ def cmd_update(args):
     # writes to a closed stdout.  No-op in gateway mode.  See
     # _install_hangup_protection for rationale.
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    # Cross-process mutual exclusion. The dashboard's Update button spawns
+    # this same command detached, and the desktop hands off to the Tauri
+    # updater / install-mode bootstrap — all three mutate one checkout. Two of
+    # them running together rewrite source under a live interpreter and strand
+    # the tree half-updated. Share the marker the Tauri updater and Electron
+    # already use rather than inventing a second lock.
+    from hermes_cli.update_lock import (
+        UPDATE_EXIT_CONCURRENT,
+        UpdateLock,
+        describe_holder,
+    )
+
+    _update_lock = UpdateLock()
+    if not _update_lock.acquire():
+        print(describe_holder(_update_lock.holder))
+        _finalize_update_output(_update_io_state)
+        sys.exit(UPDATE_EXIT_CONCURRENT)
+
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)
     finally:
+        _update_lock.release()
         _finalize_update_output(_update_io_state)
 
 
@@ -10230,7 +10543,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -11094,6 +11407,7 @@ def main():
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
     # =========================================================================
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
+    build_sync_parser(subparsers, cmd_sync=cmd_sync)
 
     # =========================================================================
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
