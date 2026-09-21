@@ -12,6 +12,7 @@ import { noteBotAttention } from './data'
 import { groupFailureReason, recordGroupActivity } from './group-activity'
 import { $groupChats, $groupClarify, appendGroupChatEntry, updateGroupChat } from './group-chat'
 import type { GroupChatRoom } from './group-chat'
+import { groupTranscriptRowText, mirrorExternalGroupWrites, syntheticGroupUserRow } from './group-external-writes'
 import {
   followGroupChat,
   groupMemberAuthor,
@@ -20,6 +21,7 @@ import {
   groupSessionOwner,
   hasThreadScopedGroupSession
 } from './group-membership'
+import { GROUP_PROMPT_HEADER_PREFIX } from './group-round-prompt'
 import { botConnectionRoute, requestForBot } from './routing'
 import type { Attachment, GroupMember, GroupPrompt, GroupPromptQuestion, ProfileRoute } from './types'
 
@@ -84,6 +86,48 @@ function pickGroupTurnReply(messages: GroupTurnTranscriptMessage[], before: numb
   return passText
 }
 
+/** The reply of a STRANDED turn: the first substantive assistant row after the
+ *  turn's own prompt (the header-prefixed user row at or after `before`),
+ *  stopping where an outside writer takes the session over. Newest-first
+ *  (`pickGroupTurnReply`) would post a CLI answer written after the late reply
+ *  as the turn reply — and the external-write mirror posts it again. Only
+ *  passes in range → the last pass; no anchor row → scan from `before`. */
+function pickStrandedGroupTurnReply(messages: GroupTurnTranscriptMessage[], before: number): null | string {
+  const anchor = messages.findIndex(
+    (msg, i) =>
+      i >= before && msg?.role === 'user' && groupTranscriptRowText(msg).startsWith(GROUP_PROMPT_HEADER_PREFIX)
+  )
+
+  let passText: null | string = null
+
+  for (let i = anchor === -1 ? before : anchor; i < messages.length; i++) {
+    const msg = messages[i]
+    const text = groupTranscriptRowText(msg)
+
+    if (msg?.role === 'user') {
+      if (text.startsWith(GROUP_PROMPT_HEADER_PREFIX) || syntheticGroupUserRow(msg, text)) {
+        continue
+      }
+
+      break
+    }
+
+    if (msg?.role !== 'assistant' || !text) {
+      continue
+    }
+
+    if (isGroupPassText(text)) {
+      passText = text
+
+      continue
+    }
+
+    return text
+  }
+
+  return passText
+}
+
 /** A clarify question blocking inside a member's session, as `session.resume`
  *  reports it. Older backends omit the field entirely. */
 interface GroupPendingClarify {
@@ -119,6 +163,22 @@ interface GroupSessionSnapshot {
   running?: boolean
   session_id?: string
   session_key?: string
+}
+
+/** Group turns are explicit user work. A member may be cold or retired when
+ *  its round begins, and session hydration can legitimately wait behind a
+ *  remote or WSL backend. Use the same three-minute budget as Desktop's
+ *  focused session hydration instead of the generic 30-second RPC deadline. */
+const GROUP_SESSION_RESUME_OPTIONS = {
+  spawnPriority: 'foreground',
+  timeoutMs: 180_000
+} as const
+
+const GROUP_SESSION_BACKGROUND_RESUME_OPTIONS = { timeoutMs: 180_000 } as const
+const GROUP_SESSION_CREATE_OPTIONS = { spawnPriority: 'foreground' } as const
+
+function resumeGroupSession(member: GroupMember, params: Record<string, unknown>): Promise<GroupSessionSnapshot> {
+  return requestForBot<GroupSessionSnapshot>(member, 'session.resume', params, GROUP_SESSION_RESUME_OPTIONS)
 }
 
 /** The error message of a RETAINED failed turn, else null. The gateway keeps
@@ -219,11 +279,11 @@ export async function ensureGroupChatSession(
       }
 
       try {
-        const res = (await requestForBot(member, 'session.resume', {
+        const res = await resumeGroupSession(member, {
           session_id: target,
           profile: member.name,
           omit_messages: true
-        })) as GroupSessionSnapshot
+        })
 
         if (!binding.isLive()) {
           return { runtime: null }
@@ -278,18 +338,23 @@ export async function ensureGroupChatSession(
       return { runtime: null }
     }
 
-    const created = (await requestForBot(member, 'session.create', {
-      profile: member.name,
-      title,
-      // Room member sessions are plumbing — always hidden from the sidebar.
-      hidden: true,
-      // Explicit contracts (PR #97008): room plumbing sessions always rebuild
-      // from the member profile's CURRENT config on resume, never a stale
-      // stored model/provider pin. Older gateways ignore the unknown params;
-      // the server's hidden + "Group: " title fallback then covers legacy.
-      room_plumbing: true,
-      follow_profile_config: true
-    })) as { session_id?: string; stored_session_id?: string }
+    const created = (await requestForBot(
+      member,
+      'session.create',
+      {
+        profile: member.name,
+        title,
+        // Room member sessions are plumbing — always hidden from the sidebar.
+        hidden: true,
+        // Explicit contracts (PR #97008): room plumbing sessions always rebuild
+        // from the member profile's CURRENT config on resume, never a stale
+        // stored model/provider pin. Older gateways ignore the unknown params;
+        // the server's hidden + "Group: " title fallback then covers legacy.
+        room_plumbing: true,
+        follow_profile_config: true
+      },
+      GROUP_SESSION_CREATE_OPTIONS
+    )) as { session_id?: string; stored_session_id?: string }
 
     if (!binding.isLive()) {
       return { runtime: null }
@@ -442,7 +507,7 @@ async function retainGroupTurnRoute(member: GroupMember): Promise<() => void> {
   }
 
   try {
-    const release = await host.retainProfile(route)
+    const release = await host.retainProfile(route, { spawnPriority: 'foreground' })
 
     return typeof release === 'function' ? release : noop
   } catch {
@@ -473,11 +538,11 @@ async function submitGroupTurnPrompt(
       throw error
     }
 
-    const res = (await requestForBot(member, 'session.resume', {
+    const res = await resumeGroupSession(member, {
       session_id: stored,
       profile: member.name,
       omit_messages: true
-    })) as GroupSessionSnapshot
+    })
 
     const fresh = res?.session_id
 
@@ -879,7 +944,11 @@ export function strandedMarkerIsLive(marker: unknown): boolean {
  *  member's gateway (a remote member's most of all: its gateway outlives this Desktop), and only
  *  a persisted marker lets the next boundary harvest the finished reply instead of dropping it
  *  and re-driving a live session. */
-function markGroupTurnInFlight(group: string, member: GroupMember, marker: { before: number; thread: string; turn: string }) {
+function markGroupTurnInFlight(
+  group: string,
+  member: GroupMember,
+  marker: { before: number; thread: string; turn: string }
+) {
   updateGroupChat(group, (r: GroupChatRoom) => {
     r.stranded = {
       ...(r.stranded || {}),
@@ -912,7 +981,6 @@ function clearGroupTurnMarker(group: string, member: GroupMember, turn: string) 
 
 async function pollGroupMemberTurn(context: GroupTurnPollContext): Promise<null | string> {
   const { member, thread, dispatchEpoch, stored, liveRuntime, runtimeIds, before, binding } = context
-  const memberKey = groupMemberKey(member)
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
   // After the terminal frame fires, the gateway still has to flip
@@ -927,19 +995,18 @@ async function pollGroupMemberTurn(context: GroupTurnPollContext): Promise<null 
 
     quickRechecks = signalled ? GROUP_TURN_SETTLE_RECHECKS : Math.max(0, quickRechecks - 1)
 
-    // #91868/#94569: an explicit stop (stopGroupThread) bumped the epoch AND
-    // held this member — the member's session was interrupted, so nothing is
-    // coming; abandon the poll instead of grinding until the deadline. Both
-    // conditions on purpose: an ordinary newer send bumps the epoch WITHOUT
-    // a hold, and that turn must keep polling so finished work can still be
-    // delivered (the #93127 commit check decides its fate, not this loop).
+    // #91868/#94569: an explicit stop stamps the epoch it minted independently
+    // of sticky holds. Abandon any turn dispatched before that stamp instead
+    // of trusting the best-effort interrupt or grinding until the deadline.
+    // Ordinary newer sends bump only `epoch`, so their late work still reaches
+    // the #93127 commit check below.
     if (!binding.isLive()) {
       return null
     }
 
     const roomDuringPoll = $groupChats.get()[context.group] || {}
 
-    if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && (roomDuringPoll.holds || {})[memberKey]) {
+    if ((roomDuringPoll.stoppedEpoch || 0) > dispatchEpoch) {
       clearGroupTurnMarker(context.group, member, context.turn)
 
       return null
@@ -948,10 +1015,10 @@ async function pollGroupMemberTurn(context: GroupTurnPollContext): Promise<null 
     let state: GroupSessionSnapshot | null = null
 
     try {
-      state = (await requestForBot(member, 'session.resume', {
+      state = await resumeGroupSession(member, {
         session_id: stored || liveRuntime,
         profile: member.name
-      })) as GroupSessionSnapshot
+      })
     } catch {
       continue
     }
@@ -1042,16 +1109,18 @@ async function prepareGroupTurnBaseline(
   // turn the gateway still retains from before it.
   let before = 0
   let leftover: null | string = null
+  let snapshot: GroupSessionSnapshot | null = null
   // Every runtime id this turn has seen for the member's session. Terminal
   // frames are keyed by runtime id, and a resume can hand back a fresh one.
   const runtimeIds = new Set<string>([runtime])
 
   try {
-    const pre = (await requestForBot(member, 'session.resume', {
+    const pre = await resumeGroupSession(member, {
       session_id: stored || runtime,
       profile: member.name
-    })) as GroupSessionSnapshot
+    })
 
+    snapshot = pre
     before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
     leftover = retainedGroupTurnError(pre) === null ? null : JSON.stringify(pre.inflight)
 
@@ -1062,7 +1131,7 @@ async function prepareGroupTurnBaseline(
     /* lazy session — zero messages */
   }
 
-  return { before, leftover, runtimeIds }
+  return { before, leftover, runtimeIds, snapshot }
 }
 
 async function runGroupChatMemberTurnLeased(
@@ -1092,7 +1161,16 @@ async function runGroupChatMemberTurnLeased(
       thread
     })
 
-    const { before, leftover, runtimeIds } = await prepareGroupTurnBaseline(member, runtime, stored)
+    const { before, leftover, runtimeIds, snapshot } = await prepareGroupTurnBaseline(member, runtime, stored)
+
+    if (!binding.isLive()) {
+      return null
+    }
+
+    // #93813: rows other writers put in this session since the last look
+    // (CLI resume, cron, tools) join the room log before this turn's own
+    // prompt lands after them.
+    mirrorExternalGroupWrites(group, member, thread, snapshot?.messages)
 
     const { failed, fileRefs } = await stageGroupTurnAttachments(member, runtime, images)
 
@@ -1188,10 +1266,15 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
       const sessions = room.sessions || {}
       const scoped = sessions[groupSessionKey(strandedThread, member)]
       const stored = scoped || (hasThreadScopedGroupSession(sessions, memberKey) ? null : sessions[memberKey])
-      state = (await requestForBot(member, 'session.resume', {
-        session_id: stored || `Group: ${room.roomId || group} · ${strandedThread}`,
-        profile: member.name
-      })) as GroupSessionSnapshot
+      state = await requestForBot<GroupSessionSnapshot>(
+        member,
+        'session.resume',
+        {
+          session_id: stored || `Group: ${room.roomId || group} · ${strandedThread}`,
+          profile: member.name
+        },
+        GROUP_SESSION_BACKGROUND_RESUME_OPTIONS
+      )
     } catch (error: any) {
       // A session that genuinely no longer exists has nothing to harvest, and a marker that can
       // never resolve would keep the member out of every round; only unreachability keeps it.
@@ -1236,7 +1319,7 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     const messages = Array.isArray(state?.messages) ? state.messages : []
     // A transcript that never grew is not proof of nothing: a turn that dies
     // before its prompt is committed leaves only the retained error behind.
-    const reply = messages.length > strandedBefore ? pickGroupTurnReply(messages, strandedBefore) : null
+    const reply = messages.length > strandedBefore ? pickStrandedGroupTurnReply(messages, strandedBefore) : null
 
     if (reply === null) {
       // The late turn died instead of answering: say so where the user looks
@@ -1261,12 +1344,7 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
         member: groupMemberKey(member),
         thread: strandedThread
       })
-      appendGroupChatEntry(
-        group,
-        groupMemberAuthor(member),
-        reply,
-        strandedThread
-      )
+      appendGroupChatEntry(group, groupMemberAuthor(member), reply, strandedThread)
       updateGroupChat(group, (r: GroupChatRoom) => {
         const markKey = `${strandedThread}::${memberKey}`
 
@@ -1277,6 +1355,10 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
         return r
       })
     }
+
+    // #93813: whatever else reached the session while the turn was stranded
+    // follows the late reply into the room.
+    mirrorExternalGroupWrites(group, member, strandedThread, messages)
   } finally {
     binding.dispose()
   }
